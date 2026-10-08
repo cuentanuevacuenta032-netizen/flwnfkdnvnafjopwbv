@@ -1,0 +1,210 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service TermService -Force
+
+      - name: Create RDP User
+        run: |
+          Add-Type -AssemblyName System.Security
+
+          $charSet = @{
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = ([char[]](33..47) + [char[]](58..64) +
+                       [char[]](91..96) + [char[]](123..126))
+          }
+
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "RDP" `
+            -Password $securePass `
+            -AccountNeverExpires
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Prepare Gaming Components
+        run: |
+          Write-Host "Installing Windows gaming components..."
+
+          # DirectX runtime
+          $dxUrl = "https://download.microsoft.com/download/1/1/C/11C5A4F2-9A1D-4B99-9C9B-8B6E4D8F5E6A/dxwebsetup.exe"
+          $dxPath = "$env:TEMP\dxwebsetup.exe"
+
+          try {
+            Invoke-WebRequest -Uri $dxUrl -OutFile $dxPath -UseBasicParsing
+            Start-Process $dxPath -ArgumentList "/Q" -Wait
+            Remove-Item $dxPath -Force -ErrorAction SilentlyContinue
+          }
+          catch {
+            Write-Host "DirectX installer could not be downloaded. Continuing..."
+          }
+
+          # .NET Framework 4.8
+          $dotnetUrl = "https://go.microsoft.com/fwlink/?linkid=2088631"
+          $dotnetPath = "$env:TEMP\ndp48.exe"
+
+          try {
+            Invoke-WebRequest -Uri $dotnetUrl -OutFile $dotnetPath -UseBasicParsing
+            Start-Process $dotnetPath -ArgumentList "/quiet","/norestart" -Wait
+            Remove-Item $dotnetPath -Force -ErrorAction SilentlyContinue
+          }
+          catch {
+            Write-Host ".NET installer could not be downloaded. Continuing..."
+          }
+
+          # 7-Zip
+          $sevenZip = "https://www.7-zip.org/a/7z2409-x64.exe"
+          $sevenZipPath = "$env:TEMP\7zip.exe"
+
+          try {
+            Invoke-WebRequest -Uri $sevenZip -OutFile $sevenZipPath -UseBasicParsing
+            Start-Process $sevenZipPath -ArgumentList "/S" -Wait
+            Remove-Item $sevenZipPath -Force -ErrorAction SilentlyContinue
+          }
+          catch {
+            Write-Host "7-Zip installer could not be downloaded. Continuing..."
+          }
+
+          Write-Host "Gaming components preparation finished."
+
+      - name: Diagnose GPU and Driver
+        run: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "       GPU / DRIVER INFORMATION"
+          Write-Host "======================================"
+
+          Write-Host ""
+          Write-Host "--- VIDEO ADAPTERS ---"
+
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name,
+                          AdapterCompatibility,
+                          DriverVersion,
+                          DriverDate,
+                          VideoProcessor,
+                          AdapterRAM |
+            Format-List
+
+          Write-Host ""
+          Write-Host "--- DISPLAY DEVICES ---"
+
+          Get-PnpDevice -Class Display |
+            Select-Object Status,
+                          FriendlyName,
+                          InstanceId |
+            Format-Table -AutoSize
+
+          Write-Host ""
+          Write-Host "--- DIRECTX ---"
+
+          dxdiag /t "$env:TEMP\dxdiag.txt"
+
+          if (Test-Path "$env:TEMP\dxdiag.txt") {
+            Get-Content "$env:TEMP\dxdiag.txt" |
+              Select-String -Pattern `
+              "Card name|Manufacturer|Chip type|Display Memory|Driver Version|Feature Levels"
+          }
+
+          Write-Host ""
+          Write-Host "======================================"
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 10) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $retries++
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned."
+            exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          $testResult = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "RDP connection failed."
+            exit 1
+          }
+
+          Write-Host "RDP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host ""
+          Write-Host "========== RDP ACCESS =========="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "================================"
+          Write-Host ""
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active"
+            Start-Sleep -Seconds 300
+          }
